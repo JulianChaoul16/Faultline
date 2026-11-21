@@ -3,19 +3,41 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "Usage: sender <url> <json-file>")
+	send := flag.NewFlagSet("send", flag.ExitOnError)
+	url := send.String("url", "", "destination URL")
+	filename := send.String("file", "", "path to the JSON file")
+	send.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: faultline send --url <url> --file <json-file>")
+		send.PrintDefaults()
+	}
+
+	if len(os.Args) < 2 || os.Args[1] != "send" {
+		send.Usage()
 		os.Exit(2)
 	}
-	if err := postJSON(os.Args[1], os.Args[2]); err != nil {
+	send.Parse(os.Args[2:])
+	if *url == "" || *filename == "" || send.NArg() != 0 {
+		send.Usage()
+		os.Exit(2)
+	}
+
+	// PowerShell passes a backslash before the scheme colon through literally.
+	destination := *url
+	scheme, rest, found := strings.Cut(destination, "://")
+	if found && (scheme == `http\` || scheme == `https\`) {
+		destination = strings.TrimSuffix(scheme, `\`) + "://" + rest
+	}
+	if err := postJSON(destination, *filename); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
