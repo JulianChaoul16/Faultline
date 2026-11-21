@@ -67,7 +67,7 @@ func TestSendTimeoutIsRecorded(t *testing.T) {
 	defer srv.Close()
 	defer close(release)
 
-	res := NewClient(50 * time.Millisecond).Send(context.Background(), Request{URL: srv.URL})
+	res := NewClient(50*time.Millisecond).Send(context.Background(), Request{URL: srv.URL})
 	if res.Err == nil || res.StatusCode != 0 || res.OK() {
 		t.Fatalf("expected timeout, got %+v", res)
 	}
