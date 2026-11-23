@@ -35,6 +35,18 @@ func TestSendRecordsSuccess(t *testing.T) {
 	}
 }
 
+func TestSendRecordsDuration(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+	}))
+	defer srv.Close()
+
+	res := NewClient(time.Second).Send(context.Background(), Request{URL: srv.URL})
+	if res.Duration < 30*time.Millisecond {
+		t.Fatalf("Duration = %s, want at least 30ms", res.Duration)
+	}
+}
+
 func TestSendNon2xxIsRecordedNotErrored(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)

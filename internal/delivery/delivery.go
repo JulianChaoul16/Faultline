@@ -61,8 +61,12 @@ func NewClient(timeout time.Duration) *Client {
 }
 
 // Send performs one POST and returns what happened.
-func (c *Client) Send(ctx context.Context, req Request) Result {
-	result := Result{Start: time.Now()}
+//
+// result is a named return value so the deferred function below can set
+// Duration on the value actually returned; with an ordinary local
+// variable, "return result" would copy it before the defer ran.
+func (c *Client) Send(ctx context.Context, req Request) (result Result) {
+	result.Start = time.Now()
 	defer func() { result.Duration = time.Since(result.Start) }()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, bytes.NewReader(req.Body))
