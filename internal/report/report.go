@@ -126,6 +126,9 @@ func answer(r delivery.Result) string {
 }
 
 func ms(d time.Duration) string {
+	if d < time.Millisecond {
+		return "<1ms" // local receivers are often faster than 1ms; "0s" reads as broken
+	}
 	return d.Round(time.Millisecond).String()
 }
 
