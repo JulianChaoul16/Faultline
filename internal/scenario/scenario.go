@@ -4,7 +4,8 @@
 // One scenario run is:
 //
 //  1. pick a fresh event ID
-//  2. deliver that same event Copies times (one after another, or all at once)
+//  2. deliver that same event Copies times (one after another, optionally
+//     with a pause between copies, or all at once)
 //  3. ask the oracle how many times the event was processed
 //  4. compare with the expected count and produce a Verdict
 package scenario
@@ -13,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"faultline/internal/delivery"
 	"faultline/internal/oracle"
@@ -23,6 +25,18 @@ type Scenario struct {
 	Name       string
 	Copies     int  // how many times the same event is delivered
 	Concurrent bool // false: one after another; true: all at the same moment
+
+	// Delay is the pause between sequential copies, measured from when the
+	// previous copy's response came back to when the next one is sent: the
+	// receiver has fully finished with the event before the retry arrives.
+	//
+	// It catches receivers that deduplicate but forget: a "seen" cache with
+	// a short TTL or eviction, or a lock held only while the event is being
+	// processed. Real providers retry minutes to days later, so a short
+	// delay only proves the receiver remembers at least that long.
+	//
+	// Only valid with Concurrent false; zero means no pause.
+	Delay time.Duration
 }
 
 // Defaults are the v1 duplicate scenarios.
@@ -80,6 +94,12 @@ func Run(ctx context.Context, cfg Config, s Scenario) (Outcome, error) {
 	if s.Copies < 1 {
 		return Outcome{}, fmt.Errorf("scenario %s: copies must be at least 1", s.Name)
 	}
+	if s.Delay < 0 {
+		return Outcome{}, fmt.Errorf("scenario %s: delay must not be negative", s.Name)
+	}
+	if s.Concurrent && s.Delay > 0 {
+		return Outcome{}, fmt.Errorf("scenario %s: delay only applies to non-concurrent copies", s.Name)
+	}
 	newID := cfg.NewID
 	if newID == nil {
 		newID = NewEventID
@@ -94,7 +114,16 @@ func Run(ctx context.Context, cfg Config, s Scenario) (Outcome, error) {
 	if s.Concurrent {
 		out.Deliveries = sendConcurrent(ctx, cfg.Client, req, s.Copies)
 	} else {
-		out.Deliveries = sendSequential(ctx, cfg.Client, req, s.Copies)
+		out.Deliveries = sendSequential(ctx, cfg.Client, req, s.Copies, s.Delay)
+	}
+
+	// Interrupted (e.g. Ctrl+C during a delay): the receiver never got
+	// every copy, so a matching count would prove nothing. This check comes
+	// before the oracle on purpose; a count of 1 here would read as PASS.
+	if len(out.Deliveries) < s.Copies {
+		out.Verdict = Inconclusive
+		out.Reason = fmt.Sprintf("interrupted after %d of %d copies", len(out.Deliveries), s.Copies)
+		return out, nil
 	}
 
 	if unreachable(out.Deliveries) {
@@ -119,12 +148,31 @@ func Run(ctx context.Context, cfg Config, s Scenario) (Outcome, error) {
 	return out, nil
 }
 
-func sendSequential(ctx context.Context, c *delivery.Client, req delivery.Request, n int) []delivery.Result {
-	results := make([]delivery.Result, n)
-	for i := range results {
-		results[i] = c.Send(ctx, req)
+// sendSequential sends n copies one after another, pausing delay between
+// them. If ctx is cancelled during a pause it stops early and returns only
+// the copies that were actually sent.
+func sendSequential(ctx context.Context, c *delivery.Client, req delivery.Request, n int, delay time.Duration) []delivery.Result {
+	results := make([]delivery.Result, 0, n)
+	for i := 0; i < n; i++ {
+		if i > 0 && delay > 0 && !wait(ctx, delay) {
+			break
+		}
+		results = append(results, c.Send(ctx, req))
 	}
 	return results
+}
+
+// wait pauses for d, returning false if ctx is cancelled first. Unlike
+// time.Sleep it lets Ctrl+C interrupt a long delay straight away.
+func wait(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // sendConcurrent starts n goroutines that all wait on a start signal, then

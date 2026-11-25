@@ -14,19 +14,27 @@ import (
 	"faultline/internal/oracle"
 )
 
-// fakeReceiver is an in-memory webhook receiver with three behaviours,
-// mirroring the naive / racy / correct example receivers.
+// fakeReceiver is an in-memory webhook receiver with four behaviours,
+// mirroring the naive / racy / correct example receivers plus "forgetful".
 type fakeReceiver struct {
-	mode string // "naive", "racy" or "correct"
+	mode string // "naive", "racy", "correct" or "forgetful"
 
 	mu       sync.Mutex
 	counts   map[string]int
+	lastSeen map[string]time.Time // forgetful only
 	inFlight int
 	maxIn    int // most requests seen in the handler at the same time
 }
 
+// forgetfulTTL is how long the forgetful mode remembers an event. Back to
+// back copies arrive well inside it; testDelay copies arrive after it.
+const (
+	forgetfulTTL = 200 * time.Millisecond
+	testDelay    = 2 * forgetfulTTL
+)
+
 func newFakeReceiver(mode string) *fakeReceiver {
-	return &fakeReceiver{mode: mode, counts: map[string]int{}}
+	return &fakeReceiver{mode: mode, counts: map[string]int{}, lastSeen: map[string]time.Time{}}
 }
 
 func (f *fakeReceiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +74,14 @@ func (f *fakeReceiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.mu.Unlock()
 		time.Sleep(20 * time.Millisecond)
+	case "forgetful":
+		// Atomic like "correct", but the memory of an event expires.
+		f.mu.Lock()
+		if seen, ok := f.lastSeen[e.ID]; !ok || time.Since(seen) > forgetfulTTL {
+			f.counts[e.ID]++
+			f.lastSeen[e.ID] = time.Now()
+		}
+		f.mu.Unlock()
 	}
 	w.WriteHeader(http.StatusOK)
 }
@@ -79,6 +95,11 @@ func (f *fakeReceiver) Count(_ context.Context, id string) (oracle.Observation, 
 
 func run(t *testing.T, mode string, s Scenario) (Outcome, *fakeReceiver) {
 	t.Helper()
+	return runCtx(t, context.Background(), mode, s)
+}
+
+func runCtx(t *testing.T, ctx context.Context, mode string, s Scenario) (Outcome, *fakeReceiver) {
+	t.Helper()
 	recv := newFakeReceiver(mode)
 	srv := httptest.NewServer(recv)
 	t.Cleanup(srv.Close)
@@ -89,7 +110,7 @@ func run(t *testing.T, mode string, s Scenario) (Outcome, *fakeReceiver) {
 		Oracle: recv,
 		Expect: 1,
 	}
-	out, err := Run(context.Background(), cfg, s)
+	out, err := Run(ctx, cfg, s)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -99,6 +120,9 @@ func run(t *testing.T, mode string, s Scenario) (Outcome, *fakeReceiver) {
 var (
 	sequential = Defaults[0]
 	concurrent = Defaults[1]
+	// delayed uses a short test delay; the real default is far too slow
+	// for unit tests.
+	delayed = Scenario{Name: "test-delayed", Copies: 2, Delay: testDelay}
 )
 
 // The verdict table v1 must get right.
@@ -114,6 +138,11 @@ func TestVerdicts(t *testing.T) {
 		{"racy", concurrent, Fail},
 		{"correct", sequential, Pass},
 		{"correct", concurrent, Pass},
+		{"correct", delayed, Pass},
+		// The bug only a delay reveals: forgetful dedups fine back to back.
+		{"forgetful", sequential, Pass},
+		{"forgetful", concurrent, Pass},
+		{"forgetful", delayed, Fail},
 	}
 	for _, c := range cases {
 		t.Run(c.mode+"/"+c.s.Name, func(t *testing.T) {
@@ -144,6 +173,35 @@ func TestSequentialCopiesDoNotOverlap(t *testing.T) {
 	_, recv := run(t, "correct", sequential)
 	if recv.maxIn != 1 {
 		t.Fatalf("max in-flight = %d, want 1", recv.maxIn)
+	}
+}
+
+func TestDelayIsBetweenCopies(t *testing.T) {
+	out, _ := run(t, "correct", delayed)
+	first, second := out.Deliveries[0], out.Deliveries[1]
+	gap := second.Start.Sub(first.Start.Add(first.Duration))
+	if gap < testDelay {
+		t.Fatalf("gap between response and next copy = %s, want at least %s", gap, testDelay)
+	}
+}
+
+// Ctrl+C during a long delay must stop promptly and must not PASS: the
+// receiver only saw one copy, which proves nothing about deduplication.
+func TestCancelDuringDelayIsInconclusive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	long := Scenario{Name: "long", Copies: 2, Delay: time.Minute}
+
+	begin := time.Now()
+	out, _ := runCtx(t, ctx, "correct", long)
+	if took := time.Since(begin); took > 5*time.Second {
+		t.Fatalf("Run took %s after cancel; the delay was not interruptible", took)
+	}
+	if out.Verdict != Inconclusive {
+		t.Fatalf("verdict = %s (%s), want INCONCLUSIVE", out.Verdict, out.Reason)
+	}
+	if len(out.Deliveries) != 1 {
+		t.Fatalf("%d deliveries, want 1 (only the copies actually sent)", len(out.Deliveries))
 	}
 }
 
@@ -209,6 +267,12 @@ func TestBadConfigIsError(t *testing.T) {
 	}
 	if _, err := Run(context.Background(), cfg, Scenario{Name: "zero", Copies: 0}); err == nil {
 		t.Fatal("expected error for zero copies")
+	}
+	if _, err := Run(context.Background(), cfg, Scenario{Name: "both", Copies: 2, Concurrent: true, Delay: time.Second}); err == nil {
+		t.Fatal("expected error for delay on concurrent copies")
+	}
+	if _, err := Run(context.Background(), cfg, Scenario{Name: "neg", Copies: 2, Delay: -time.Second}); err == nil {
+		t.Fatal("expected error for negative delay")
 	}
 }
 
